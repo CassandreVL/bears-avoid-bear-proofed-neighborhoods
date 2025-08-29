@@ -1,0 +1,1076 @@
+---
+title: "Bears avoid residential neighborhoods in response to the experimental reduction of anthropogenic attractants. R Code"
+author: "Cassandre Venumière-Lefebvre"
+date: "June 30, 2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+library(amt)
+library(boot)
+library(cowplot)
+library(dplyr)
+library(effects)
+library(FedData)
+library(ggmap)
+library(ggnewscale)
+library(ggplot2)
+library(ggpubr)
+library(ggspatial)
+library(glmmTMB)
+library(gstat)
+library(landscapemetrics)
+library(lubridate)
+library(AICcmodavg)
+library(raster)
+library(sf)
+library(sp)
+library(stats)
+library(terra)
+library(tictoc)
+library(tidyr)
+library(tigris)
+library(viridis)
+```
+
+# Data
+
+## GPS data
+
+```{r GPS data}
+gps = st_read(dsn = "data/gps/gps_NAD_13N.shp")
+gps.df = gps %>%
+  mutate(x = sf::st_coordinates(.)[,1], y = sf::st_coordinates(.)[,2]) %>% 
+  mutate(Year = as.character(Date)) %>% 
+  mutate(Year = as.numeric(substr(Year, 1, 4))) %>% 
+  dplyr::select(c(BearID, Date, Year, Time, x, y, lat, lon)) %>% 
+  mutate(ID = paste(BearID, Year, sep = "_")) %>% 
+  mutate(t = ymd(Date) + hms(Time)) %>% 
+  dplyr::filter(lubridate::month(t) >= 7 & lubridate::month(t) <= 9)
+
+df = as.data.frame(table(gps.df$BearID, gps.df$Year)) %>% pivot_wider(names_from = Var2, values_from = Freq)
+colnames(df)[1] = "BearID"
+```
+```{r check home ranges, eval = FALSE}
+parcels = st_read("data/parcels/parcels.shp") %>%
+  st_transform(parcels, crs = my_crs) 
+parcel_compliance = read.csv("data/parcels/parcel_compliance.csv")
+parcels = st_intersection(parcels, zones) %>%
+  filter(grepl("POLYGON", st_geometry_type(geometry))) %>% 
+  mutate(zone = Id) 
+parcels = parcels %>% 
+  mutate(Id = c(1:nrow(parcels)))
+parcels = merge(parcels, parcel_compliance, by = "Id", all = T)
+parcels$name = as.factor(parcels$name)
+
+bears = unique(steps_1$ID)
+gps_big = gps.df %>% filter(ID %in% bears)
+
+ggplot() +
+  geom_sf(data = gps_big, aes(col = BearID)) +
+  geom_sf(data = parcels, aes(fill = Treatment), linewidth = 0.005) +
+  scale_fill_manual(values = c("#440154FF", "#95D840FF"))
+
+hulls_95 <- gps_big %>%
+  group_by(ID) %>%
+  summarize(.groups = "keep") %>%
+  mutate(cent = sf::st_centroid(geometry)) %>%
+  sf::st_cast(to = "POINT") %>%
+  mutate(dist = sf::st_distance(geometry, cent, by_element = TRUE)) %>%
+  filter(dist <= quantile(dist, 0.95)) %>%
+  summarize(.groups = "keep") %>%
+  sf::st_convex_hull() %>%
+  st_sf() %>%
+  mutate(area = st_area(geometry))
+
+# 95% MCP of 16 bears durign hyperphagia
+summary(hulls_95$area)/1000000
+# Experimental area
+sum(st_area(zones))/1000000
+```
+
+## Covariates
+
+```{r study area}
+#Zones
+zones = st_read("data/zones/Zones13N.shp")
+my_crs = crs(zones)
+#Study area
+studyarea = st_union(zones)
+#Buffer
+buffer = st_buffer(studyarea, dist = 1500)
+#Frame
+frame = st_buffer(buffer, dist = 5000)
+# City limits
+citylim = st_read("data/citylimits/citylimits.shp") %>% filter(CTYLIMIT == "Durango") %>% st_transform(crs = "epsg:4269")
+```
+
+```{r covariates, eval = FALSE}
+# Canopy
+canopy = get_nlcd(gps, label = "canopy", year = 2011, dataset = "canopy")  %>% terra::project(my_crs) %>% crop(frame) %>% subst(NA, 0)
+writeRaster(canopy, filename = "data/canopy.tif", overwrite = T)
+
+# Impervious
+impervious = get_nlcd(gps, label = "impervious", year = 2011, dataset = "impervious") %>% terra::project(my_crs) %>% crop(frame) %>% subst(NA, 0)
+writeRaster(impervious, filename = "data/impervious.tif", overwrite = T)
+
+# Elevation, slope, aspect
+elevation = get_ned(gps, label = "elevation") %>% terra::project(my_crs) %>% crop(frame)
+writeRaster(elevation, filename = "data/elevation.tif", overwrite = T)
+
+slope = terrain(elevation, v = "slope", unit = "degrees", neighbors = 8) 
+writeRaster(slope, filename = "data/slope.tif", overwrite = T)
+
+aspect = terrain(elevation, v = "aspect", unit = "degrees", neighbors = 8) %>% 
+  classify(matrix(c(0, 45, 1, 45, 135, 2, 135, 225, 3, 225, 315, 4, 315, 360, 1), ncol = 3, byrow = T))
+levels(aspect) = data.frame(ID = c(1:4), Aspect = c("N", "E", "S", "W"))
+writeRaster(aspect, filename = "data/aspect.tif", overwrite = T)
+
+# NLCD
+nlcd = get_nlcd(gps, label = "gps", year = 2011, dataset = "landcover") %>% terra::project(my_crs) %>% crop(frame) 
+writeRaster(nlcd, filename = "data/nlcd_2011.tif", overwrite = T)
+
+# Levels of development
+development_num = classify(nlcd, matrix(c(c(21, 22, 23, 24, 11, 31, 41, 42, 43,  52, 71, 81, 82, 90, 95), c(1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)), ncol = 2))
+writeRaster(development_num, filename = "data/development_num.tif", overwrite = T)
+
+development_all = classify(nlcd, matrix(c(c(21, 22, 23, 24, 11, 31, 41, 42, 43,  52, 71, 81, 82, 90, 95), c(1, 2, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)), ncol = 2))
+levels(development_all) = data.frame(ID = c(0:3), Class = c("undeveloped", "low", "medium", "high"))
+writeRaster(development_all, filename = "data/development_all.tif", overwrite = T)
+
+development_bin = classify(development_all, matrix(c(c(1, 2, 3, 4, 0), c(1, 1, 1, 1, 0)), ncol = 2))
+writeRaster(development_bin, filename = "data/development_bin.tif", overwrite = T)
+
+dist_to_dev = development_bin %>% terra::gridDist(1)
+writeRaster(dist_to_dev, filename = "data/dist_to_dev.tif", overwrite = T)
+
+# Forest
+forest = nlcd == 41 | nlcd == 42 | nlcd == 43
+writeRaster(forest, filename = "data/forest.tif", overwrite = T)
+
+# Distance to rivers and streams
+rivers = linear_water("CO", "La Plata", year = 2013) %>% st_transform(my_crs) %>% st_crop(frame) %>% mutate(FULLNAME = replace_na(FULLNAME, "unnamed"))
+dist_to_rivers = rivers %>% terra::rasterize(., nlcd, field = 1, background = 0) %>% gridDist(1) 
+writeRaster(dist_to_rivers, filename = "data/dist_to_rivers.tif", overwrite = T)
+
+# Parks
+parks = st_read("data/parks/parks.shp") %>% st_transform(my_crs) %>% filter(score < 4)
+dist_to_parks = parks %>% terra::rasterize(., nlcd, field = 1, background = 0) %>% gridDist(1)  
+writeRaster(dist_to_parks, filename = "data/dist_to_parks.tif", overwrite = T)
+
+#Parcels
+parcels = st_read("data/parcels/parcels.shp") %>%
+  st_transform(parcels, crs = my_crs) 
+parcel_compliance = read.csv("data/parcels/parcel_compliance.csv")
+parcels = st_intersection(parcels, zones) %>%
+  filter(grepl("POLYGON", st_geometry_type(geometry))) %>% 
+  mutate(zone = Id) 
+parcels = parcels %>% 
+  mutate(Id = c(1:nrow(parcels)))
+parcels = merge(parcels, parcel_compliance, by = "Id", all = T)
+parcels$name = as.factor(parcels$name)
+parcels = parcels %>% mutate(area = as.numeric(st_area(parcels))) %>% filter(!is.na(name))
+parcels.ras = terra::rasterize(parcels, nlcd, field = "name", background = NA, touches = T) %>% crop(frame)
+writeRaster(parcels.ras, filename = "data/parcels.tif", overwrite = T)
+parcel_area = terra::rasterize(parcels, nlcd, field = "area", background = NA, touches = T) %>% crop(frame)
+writeRaster(parcel_area, filename = "data/parcel_area.tif", overwrite = T)
+
+#Districts
+districts = st_read("data/districts/districts.shp") %>%
+  st_transform(districts, crs = my_crs) 
+districts.ras = districts %>% terra::rasterize(., nlcd, field = "Code", background = NA, touches = T) %>% crop(frame)
+writeRaster(districts.ras, filename = "data/districts.tif", overwrite = T)
+
+classification = data.frame(Code = c("BP","CB","CG","EN-1","EN-2","EN-3","EN-4","EN-5","EN-6","EN-MF","IL","MU-A","MU-N","OS","PB","PD","RA","RH","RM"),
+                            legend = c("Business Park","Central Business","Commercial General","Neighborhood - College","Neighborhood - West 2nd","Neighborhhod - East Animas","Neighborhood - Crestview & Needham","Neighborhood - Riverview","Neighborhood - Hillcrest","Multifamily housing","Industrial Light","Mixed Use Arterial","Mixed Use Neighborhood","Open Space","Public","Planned Development","Rural/Agriculture","Residential High","Residential Medium"),
+                            palette = c("pink1","pink2","pink3","orangered","orangered2","orangered3","orangered4","coral1","coral2","coral3","grey","purple4","purple3","green4","lightgreen", "grey90","gold1","gold4","gold3"),
+                            new.code = c("BC","BC","BC","RN","RN","RN","RN","RN","RN","MF","BC","MU","MU","OS","PB","PD","RA","RN","RN"),
+                            new.legend = c(rep("Business/Commercial", 3), rep("Residential Neighborhood", 6), "Multifamily housing", "Business/Commercial", rep("Mixed Use", 2),"Open Space","Public","Planned Development","Rural/Agriculture", rep("Residential Neighborhood", 2)),
+                            new.palette = c(rep("pink2", 3), rep("orangered2", 6), "orangered3", "pink2", rep("purple4", 2),"green4","lightgreen", "grey","gold2", rep("orangered2", 2)))
+
+
+districts.ras = merge(districts, classification) %>% terra::rasterize(., nlcd, field = "new.code", background = NA, touches = T)
+districts_mu = districts.ras == "MU" 
+values(districts_mu) = as.numeric(values(districts_mu))
+values(districts_mu)[is.na(values(districts_mu))] = 0
+dist_to_mu = districts_mu %>% gridDist(1)
+writeRaster(dist_to_mu, filename = "data/dist_to_mu.tif", overwrite = T)
+
+# Alleys
+alleys = st_read("data/alleys/alleys.shp") %>% st_transform(., crs = my_crs) 
+dist_to_alleys = alleys %>% terra::rasterize(., nlcd, field = 1, background = 0) %>% gridDist(1) 
+writeRaster(dist_to_alleys, filename = "data/dist_to_alleys.tif", overwrite = T)
+```
+
+```{r experiment, eval = FALSE}
+zones.ras = rasterize(zones, nlcd, field = "Id", background = 0)
+treatment.before = treatment.after = classify(zones.ras, matrix(c(0,0,1,1,2,1,3,0,4,0), ncol = 2, byrow = T))
+values(treatment.before) = 0
+writeRaster(treatment.before, filename = "data/treatment_before.tif", overwrite = T)
+writeRaster(treatment.after, filename = "data/treatment_after.tif", overwrite = T)
+```
+
+```{r compliance, eval = FALSE}
+compliance = parcels %>% 
+  group_by(name) %>% 
+  summarise(geometry = st_convex_hull(st_union(geometry))) %>% 
+  filter(!is.na(name))
+block_comp = parcel_compliance %>% dplyr::select(!c(Id,X)) %>% unique()
+compliance = merge(compliance, block_comp, by = "name")
+
+# As raster
+compliance.2013 = rasterize(compliance, field = "X2013", nlcd)
+compliance.2014 = rasterize(compliance, field = "X2014", nlcd)
+compliance.2015 = rasterize(compliance, field = "X2015", nlcd)
+compliance.2016 = rasterize(compliance, field = "X2016", nlcd)
+
+# Save
+writeRaster(compliance.2013, filename = "data/compliance.2013.tif", overwrite=TRUE)
+writeRaster(compliance.2014, filename = "data/compliance.2014.tif", overwrite=TRUE)
+writeRaster(compliance.2015, filename = "data/compliance.2015.tif", overwrite=TRUE)
+writeRaster(compliance.2016, filename = "data/compliance.2016.tif", overwrite=TRUE)
+```
+
+```{r natural food availability}
+nat_food = read.csv("data/compliance_natural_food.csv") %>% 
+  dplyr::select(Year, index_2018 = Natural.food) %>% 
+  mutate(index_2020 = c(21.92, 2.28, 3.17, 12.95, 8.60, 13.22)) %>% 
+  mutate(nf = c(0, 1, 0, 0, 0, 0))
+```
+
+```{r rasterstack}
+nlcd = rast("data/nlcd_2011.tif") %>% project(my_crs) %>% crop(frame)
+# Rivers
+dist_to_rivers = rast("data/dist_to_rivers.tif") %>% project(nlcd)
+dist_to_rivers = log(dist_to_rivers + 1)
+#Parks
+dist_to_parks = rast("data/dist_to_parks.tif") %>% project(nlcd)
+
+# Elevation, slope and aspect
+elevation = rast("data/elevation.tif") %>% project(nlcd)
+slope = rast("data/slope.tif") %>% project(nlcd)
+aspect = rast("data/aspect.tif") %>% project(nlcd)
+
+# Vegetation and canopy cover
+canopy = rast("data/canopy.tif") %>% project(nlcd)
+forest = rast("data/forest.tif")  %>% project(nlcd, method = "near")
+
+# Human development
+development_all = rast("data/development_all.tif") %>% project(nlcd, method = "near")
+development_bin = rast("data/development_bin.tif") %>% project(nlcd, method = "near")
+development_num = rast("data/development_num.tif") %>% project(nlcd, method = "near")
+dist_to_dev = rast("data/dist_to_dev.tif") %>% project(nlcd)
+dist_to_dev = log(dist_to_dev + 1)
+impervious = rast("data/impervious.tif") %>% project(nlcd)
+
+#Parcel area
+parcel_area = rast("data/parcel_area.tif") %>% project(nlcd)
+parcels.ras = rast("data/parcels.tif") 
+
+#Districts
+districts = rast("data/districts.tif") %>% project(nlcd)
+dist_to_mu = rast("data/dist_to_mu.tif") %>% project(nlcd)
+dist_to_alleys = rast("data/dist_to_alleys.tif") %>% project(nlcd)
+
+# Experiment
+treatment.before = rast("data/treatment_before.tif") %>% project(nlcd, method = "near")
+treatment.after = rast("data/treatment_after.tif") %>% project(nlcd, method = "near")
+
+# Compliance
+compliance.2013 = rast("data/compliance.2013.tif") %>% project(nlcd)
+compliance.2014 = rast("data/compliance.2014.tif") %>% project(nlcd)
+compliance.2015 = rast("data/compliance.2015.tif") %>% project(nlcd)
+compliance.2016 = rast("data/compliance.2016.tif") %>% project(nlcd)
+
+# SpatRaster Stacks
+layers = c(elevation, slope, canopy, forest, dist_to_rivers, development_bin, development_all, development_num, impervious, dist_to_dev, parcel_area, dist_to_parks, dist_to_mu, dist_to_alleys, districts, compliance.2013, compliance.2014, compliance.2015, compliance.2016, treatment.before, treatment.after)
+names(layers) = c("elevation", "slope", "canopy", "forest", "dist_to_rivers", "development_bin", "development_all", "development_num", "impervious", "dist_to_dev", "parcel_area", "dist_to_parks", "dist_to_mu", "dist_to_alleys", "districts", "compliance.2013", "compliance.2014", "compliance.2015", "compliance.2016", "treatment.before", "treatment.after")
+
+buffer.ras = st_sf(buffer) %>% terra::rasterize(., nlcd, field = 1, background = NA)
+layers1 = crop(mask(layers[[c(1:10,21)]], buffer.ras), buffer)
+plot(layers1)
+```
+
+```{r correlation layers}
+cor.table = as.data.frame(layerCor(layers1, fun  = "pearson")$correlation) %>% round(digits = 2)
+write.csv(cor.table, "output/cor.table.csv")
+```
+
+## Steps 
+
+```{r steps preparation}
+set.seed(100) 
+steps_1 = gps.df %>% 
+  # Keep locations inside of the experimental area
+  sf::st_intersection(., buffer) %>% 
+  # Organize data by individuals (bear-years)
+  nest(data = -c(ID, BearID, Year)) %>% 
+  # Make tracks
+  mutate(observed_steps = lapply(data, function(d) { amt::make_track(d, x, y, t, crs = my_crs) })) %>%
+  # Remove steps shorter than 30m
+  mutate(observed_steps = lapply(observed_steps, function(x) {x %>% mutate(sl_ = step_lengths(x)) %>% filter(sl_ >= 30)})) %>% 
+  mutate(n_loc = sapply(observed_steps, function(x) { nrow(x) })) %>% filter(n_loc > 0) %>% 
+  # Remove faulty collar (2H fix)
+  filter(!c(BearID == "B124" & Year == 2016)) %>% 
+  # Resample every 1H
+  mutate(observed_steps = lapply(observed_steps, function(x) { x %>% amt::track_resample(rate = hours(1), tolerance = minutes(10)) %>% amt::filter_min_n_burst(min_n = 4) %>% amt::steps_by_burst() })) %>% 
+  # Remove bear-years with less than 10 steps
+  mutate(n_steps = sapply(observed_steps, function(x) {nrow(x)})) %>% filter(n_steps > 10) %>% 
+  # Draw 10 available steps for each used step
+  mutate(random_steps = lapply(observed_steps, function(x) { x %>% amt::time_of_day(where = "both") %>% random_steps(n_control = 10) %>% 
+  # Extract map covariates
+      amt::extract_covariates(layers, where = "both") %>% 
+      mutate(day_start = case_when(tod_start_ == "day" ~ 1, tod_start_ == "night" ~ 0)) %>% 
+      mutate(day_end = case_when(tod_end_ == "day" ~ 1, tod_end_ == "night" ~ 0)) %>% 
+      mutate(treatment_start = case_when(lubridate::year(t1_) == 2011 | lubridate::year(t1_) == 2012 ~ treatment.before_start, lubridate::year(t1_) == 2013 | lubridate::year(t1_) == 2014 | lubridate::year(t1_) == 2015 | lubridate::year(t1_) == 2016 ~ treatment.after_start)) %>% 
+      mutate(treatment_end = case_when(lubridate::year(t1_) == 2011 | lubridate::year(t1_) == 2012 ~ treatment.before_end, lubridate::year(t1_) == 2013 | lubridate::year(t1_) == 2014 | lubridate::year(t1_) == 2015 | lubridate::year(t1_) == 2016 ~ treatment.after_end)) %>% 
+      dplyr::select(burst_, x1_, x2_, y1_, y2_, sl_, ta_, t1_, t2_, dt_, case_, step_id_, day_start, day_end, elevation_start, elevation_end, slope_start, slope_end, canopy_start, canopy_end, forest_start, forest_end, dist_to_rivers_start, dist_to_rivers_end, development_bin_start, development_bin_end, development_all_start, development_all_end, development_num_start, development_num_end, impervious_start, impervious_end, dist_to_dev_start, dist_to_dev_end, treatment_start, treatment_end) })) %>% 
+  mutate(n_used_steps = sapply(random_steps, function(x) { length(unique(x$step_id_)) })) %>% 
+  mutate(n_all_steps = sapply(random_steps, function(x) { nrow(x) }))
+
+# Summary table
+count_steps_1 = steps_1 %>% xtabs(formula = n_used_steps ~ BearID + Year) %>% as.data.frame() %>% pivot_wider(names_from = Year, values_from = Freq)
+df = df %>% filter(BearID %in% count_steps_1$BearID) 
+count_steps_1[df == 0] = NA
+#write.csv(count_steps_1, file = "output/count_steps_1.csv")
+sum(steps_1$n_used_steps)
+steps_1 = steps_1 %>% dplyr::select(BearID, Year, ID, random_steps) %>% unnest(random_steps) 
+summary_steps_1_1 = steps_1 %>% filter(case_ == T) %>% group_by(BearID, Year) %>% 
+  summarize(across(c(sl_, ta_, canopy_end, elevation_end, dist_to_rivers_end, slope_end, impervious_end), mean))
+summary_steps_1_2 = steps_1 %>% filter(case_ == T) %>% group_by(BearID, Year) %>% 
+  summarize(treatment_end_in = sum(treatment_end == 1), treatment_end_out = sum(treatment_end == 0))
+summary_steps_1 = merge(summary_steps_1_1, summary_steps_1_2) %>% arrange(Year)
+#write.csv(summary_steps_1, file = "output/summary_steps_1.csv")
+
+# Scale values
+cols_1 = c("elevation_start", "elevation_end", "slope_start", "slope_end", "canopy_start", "canopy_end", "dist_to_rivers_start", "dist_to_rivers_end", "impervious_start", "impervious_end", "dist_to_dev_start", "dist_to_dev_end")
+covariates_1 = as.data.frame(rbind(sapply(steps_1[cols_1], mean, na.rm = T), sapply(steps_1[cols_1], sd, na.rm = T))) %>% t()
+colnames(covariates_1) = c("mean", "sd")
+covariates_1 = as.data.frame(covariates_1)
+
+# Keep scaled data
+steps_1 = steps_1 %>% 
+  mutate(id = as.factor(ID)) %>% 
+  mutate(indiv_step_id = as.factor(paste(ID, step_id_))) %>% 
+  mutate(across(all_of(cols_1), scale)) %>% 
+  mutate(time = Year-2012) %>% mutate(time = case_when(time <= 0 ~ 0, time > 0 ~ time)) %>% 
+  mutate(food = scale(case_when(Year == 2011 ~ nat_food$index_2018[1], 
+                          Year == 2012 ~ nat_food$index_2018[2],
+                          Year == 2013 ~ nat_food$index_2018[3],
+                          Year == 2014 ~ nat_food$index_2018[4],
+                          Year == 2015 ~ nat_food$index_2018[5],
+                          Year == 2016 ~ nat_food$index_2018[6])))
+
+summary(steps_1)
+```
+
+## Maps
+
+```{r Maps, eval = TRUE}
+# Upload and project all spatial data needed for maps
+
+#Parcels
+parcels = st_read("data/parcels/parcels.shp") %>%
+  st_transform(parcels, crs = my_crs) 
+parcel_compliance = read.csv("data/parcels/parcel_compliance.csv")
+parcels = st_intersection(parcels, zones) %>%
+  filter(grepl("POLYGON", st_geometry_type(geometry))) %>% 
+  mutate(zone = Id) 
+parcels = parcels %>% 
+  mutate(Id = c(1:nrow(parcels)))
+parcels = merge(parcels, parcel_compliance, by = "Id", all = T)
+parcels$name = as.factor(parcels$name)
+parcels.lonlat = st_transform(parcels, crs = "epsg:4269")
+
+# Buffer polygon
+frame.lonlat = st_transform(frame, crs = "epsg:4269")
+buffer.lonlat = st_transform(buffer, crs = "epsg:4269")
+diff = st_difference(frame.lonlat, buffer.lonlat)
+zones.lonlat = st_transform(zones, crs = "epsg:4269")
+
+# Counties and cities
+cocounties = st_read("data/colorado_counties/colorado_county_boundaries.shp")
+bbcorange = st_read("data/blackbearange/blackbearange.shp") 
+Denver = st_point(c(500725.62,4399127.19))
+Durango = st_point(c(244745.90,4128765.55))
+Colorado = st_point(c(450000, 4330000))
+cities = data.frame(name = c("Denver", "Durango"), geom = st_sfc(Denver, Durango))
+label = data.frame(name = "COLORADO", geom = st_sfc(Colorado))
+cities = st_as_sf(cities, crs = "epsg:26913")
+label = st_as_sf(label, crs = "epsg:26913")
+
+# Google Earth base map
+register_google(key = "insert your Google API key")
+bb = make_bbox(lat = c(37.24838, 37.32029), lon = c(-107.9071, -107.8495))
+base_map = get_map(bb, maptype = "satellite", zoom = 13)
+
+# Collar locations
+obs_steps = steps_1 %>% filter(case_ == T) %>% dplyr::select(BearID, Year, x1_, x2_, y1_, y2_) %>% rowwise() %>% 
+  mutate(point = st_sfc(st_multipoint(x = matrix(c(x1_, x2_, y1_, y2_), 2), dim = "XY"), crs = "epsg:26913")) %>% 
+  mutate(geometry = st_transform(point, crs = "epsg:4269")) %>% st_as_sf() %>% st_transform(crs = "epsg:4269")
+
+# Steps for 1 bear
+steps_b51 = steps_1 %>% 
+  filter(BearID == "B51" & Year == 2013) %>% 
+  filter(!is.na(x2_)) %>% 
+  dplyr::select(BearID, Year, case_, x1_, x2_, y1_, y2_) %>% 
+  rowwise() %>% 
+  mutate(lines = st_sfc(st_linestring(x = matrix(c(x1_, x2_, y1_, y2_), 2), dim = "XY"), crs = "epsg:26913")) %>% 
+  mutate(geometry = st_transform(lines, crs = "epsg:4269")) %>% 
+  st_as_sf() %>% 
+  st_transform(crs = "epsg:4269")
+
+steps_b27 = steps_1 %>% 
+  filter(BearID == "B27" & Year == 2013) %>% 
+  filter(!is.na(x2_)) %>% 
+  dplyr::select(BearID, Year, case_, x1_, x2_, y1_, y2_) %>% 
+  rowwise() %>% 
+  mutate(lines = st_sfc(st_linestring(x = matrix(c(x1_, x2_, y1_, y2_), 2), dim = "XY"), crs = "epsg:26913")) %>% 
+  mutate(geometry = st_transform(lines, crs = "epsg:4269")) %>% 
+  st_as_sf() %>% 
+  st_transform(crs = "epsg:4269")
+
+# Colorado map
+co_map = ggplot() +
+  geom_sf(data = cocounties, col = "grey90", fill = "grey90") +
+  geom_sf(data = bbcorange, fill = "sienna3", alpha = .85) +
+  geom_sf(data = cities, aes(size = 8)) +
+  geom_sf_label(data = cities, aes(label = name), nudge_x = 1, nudge_y = .3, size = 8) +
+  geom_sf_text(data = label, aes(label = name), size = 10) +
+  theme_map() + theme(legend.position = "none") 
+co_map
+
+# Study area
+sa_map = ggmap(base_map) +
+  geom_sf(data = diff, alpha = 0.4, linewidth = 1, col = "white", inherit.aes = FALSE) +
+  geom_sf(data = parcels.lonlat, aes(fill = Treatment), alpha = 1, linewidth = .005, inherit.aes = FALSE, show.legend = F) +
+  scale_fill_manual(values = c("#440154FF", "#95D840FF")) +
+  new_scale("fill") +
+  geom_sf(data = obs_steps, linewidth = .005, pch = 21, size = .5, aes(col = BearID, fill = BearID), inherit.aes = FALSE, show.legend = F) +
+  scale_fill_viridis(discrete = T, option = "turbo",  begin = 0, end = 1) +
+  scale_color_viridis(discrete = T, option = "turbo",  begin = 0, end = 1) +
+  annotation_scale(location = "bl", 
+                   height = unit(0.1 ,"cm"), 
+                   pad_x = unit(2,"cm"), 
+                   pad_y = unit(1.5,"cm"), 
+                   text_col = "black", 
+                   line_col = "black",
+                   text_cex = 1) +
+  annotation_north_arrow(location = "bl", which_north = "true", 
+                         height = unit(.7, "cm"), width = unit(.4, "cm"), 
+                         pad_x = unit(4,"cm"), pad_y = unit(2,"cm"),
+                         style = north_arrow_orienteering(line_col = "black", fill = c("black", "black"), text_size = 8, text_col = "black")) +
+  theme_map() +
+  theme(legend.position = "inside", legend.position.inside = c(.775,.5), legend.background = element_rect(fill = NA, linetype = "blank"), legend.text = element_text(colour = "black")) 
+sa_map
+
+# Steps for 1 bear
+b51 = ggmap(base_map) +
+  geom_sf(data = diff, alpha = 0.4, linewidth = .2, col = "white", inherit.aes = FALSE) +
+  geom_sf(data = parcels.lonlat, aes(fill = Treatment), linewidth = .005, inherit.aes = FALSE, show.legend = F) +
+  geom_sf(data = steps_b51[which(steps_b51$case_==F),], col = "white", inherit.aes = FALSE) +
+  geom_sf(data = steps_b51[which(steps_b51$case_==T),], col = "red3", inherit.aes = FALSE) +
+  scale_fill_manual(values = c("#440154FF", "#95D840FF")) +
+  theme_map() + theme(legend.position = "inside", legend.position.inside = c(.775,.5), legend.background = element_rect(fill = NA, linetype = "blank"), legend.text = element_text(colour = "white")) 
+b51
+
+b27 = ggmap(base_map) +
+  geom_sf(data = diff, alpha = 0.4, linewidth = .2, col = "white", inherit.aes = FALSE) +
+  geom_sf(data = parcels.lonlat, aes(fill = Treatment), linewidth = .005, inherit.aes = FALSE, show.legend = F) +
+  geom_sf(data = steps_b27[which(steps_b27$case_==F),], col = "white", inherit.aes = FALSE) +
+  geom_sf(data = steps_b27[which(steps_b27$case_==T),], col = "red3", inherit.aes = FALSE) +
+  scale_fill_manual(values = c("#440154FF", "#95D840FF")) +
+  theme_map() + theme(legend.position = "inside", legend.position.inside = c(.775,.5), legend.background = element_rect(fill = NA, linetype = "blank"), legend.text = element_text(colour = "white")) 
+b27
+```
+
+# Analysis
+
+```{r univariate models, eval = FALSE}
+# Development layers
+dev_null = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id), family = poisson())
+
+dev_bin_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + development_bin_end + (1 | id / indiv_step_id), family = poisson())
+dev_bin_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (development_bin_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+dev_bin_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + development_bin_end + (development_bin_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+
+dev_all_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + development_all_end + (1 | id / indiv_step_id), family = poisson())
+dev_all_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (development_all_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+dev_all_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + development_all_end + (development_all_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+
+dev_num_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + development_num_end + (1 | id / indiv_step_id), family = poisson())
+dev_num_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (development_num_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+dev_num_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + development_num_end + (development_num_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+
+dev_num2_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + development_num_end + I(development_num_end^2) + (1 | id / indiv_step_id), family = poisson())
+dev_num2_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (development_num_start + I(development_num_start^2)):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+dev_num2_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + development_num_end + I(development_num_end^2) + (development_num_start+ I(development_num_start^2)):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+
+dev_imp_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + impervious_end + (1 | id / indiv_step_id), family = poisson())
+dev_imp_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (impervious_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+dev_imp_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + impervious_end + (impervious_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+
+dev_imp2_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + impervious_end + I(impervious_end^2) + (1 | id / indiv_step_id), family = poisson())
+dev_imp2_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (impervious_start + I(impervious_start^2)):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+dev_imp2_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + impervious_end + I(impervious_end^2) + (impervious_start + I(impervious_start^2)):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+
+dev_dist_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + dist_to_dev_end + (1 | id / indiv_step_id), family = poisson())
+dev_dist_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (dist_to_dev_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+dev_dist_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + dist_to_dev_end + (dist_to_dev_start):(log(sl_) + cos(ta_)) + (1 | id / indiv_step_id), family = poisson())
+
+models = c("w(.)phi(.)", "w(devbin)phi(.)", "w(.)phi(devbin)", "w(devbin)phi(devbin)",  "w(devcat)phi(.)", "w(.)phi(devcat)", "w(devcat)phi(devcat)", "w(devcont)phi(.)", "w(.)phi(devcont)", "w(devcont)phi(devcont)","w(devcont2)phi(.)", "w(.)phi(devcont2)", "w(devcont2)phi(devcont2)", "w(impervious)phi(.)", "w(.)phi(impervious)", "w(impervious)phi(impervious)","w(impervious2)phi(.)", "w(.)phi(impervious2)", "w(impervious2)phi(impervious2)", "w(devdist)phi(.)", "w(.)phi(devdist)", "w(devdist)phi(devdist)")
+aictab(cand.set = list(dev_null, dev_bin_sf, dev_bin_mk, dev_bin_sfmk, dev_all_sf, dev_all_mk, dev_all_sfmk, dev_num_sf, dev_num_mk, dev_num_sfmk, dev_num2_sf, dev_num2_mk, dev_num2_sfmk, dev_imp_sf, dev_imp_mk, dev_imp_sfmk, dev_imp2_sf, dev_imp2_mk, dev_imp2_sfmk, dev_dist_sf, dev_dist_mk, dev_dist_sfmk), modnames = models)
+
+# Vegetation layers
+veg_null = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id), family = poisson())
+veg_canopy_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + canopy_end + (1 | id / indiv_step_id), family = poisson())
+veg_canopy_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (log(sl_) + cos(ta_)):canopy_start + (1 | id / indiv_step_id), family = poisson())
+veg_canopy_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + canopy_end + (log(sl_) + cos(ta_)):canopy_start + (1 | id / indiv_step_id), family = poisson())
+veg_forest_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + forest_end + (1 | id / indiv_step_id), family = poisson())
+veg_forest_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (log(sl_) + cos(ta_)):forest_start + (1 | id / indiv_step_id), family = poisson())
+veg_forest_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + forest_end + (log(sl_) + cos(ta_)):forest_start + (1 | id / indiv_step_id), family = poisson())
+
+models = c("w(.)phi(.)", "w(canopy)phi(.)", "w(.)phi(canopy)", "w(canopy)phi(canopy)", "w(forest)phi(.)", "w(.)phi(forest)", "w(forest)phi(forest)")
+aictab(cand.set = list(veg_null, veg_canopy_sf, veg_canopy_mk, veg_canopy_sfmk, veg_forest_sf, veg_forest_mk, veg_forest_sfmk), modnames = models)
+
+# Elevation - quadratic or not
+elev_null = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id), family = poisson())
+
+elev_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + elevation_end + (1 | id / indiv_step_id), family = poisson())
+elev_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (log(sl_) + cos(ta_)):elevation_start + (1 | id / indiv_step_id), family = poisson())
+elev_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + elevation_end + (log(sl_) + cos(ta_)):elevation_start + (1 | id / indiv_step_id), family = poisson())
+
+elev2_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + (1 | id / indiv_step_id), family = poisson())
+elev2_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (log(sl_) + cos(ta_)):(elevation_start + I(elevation_start^2)) + (1 | id / indiv_step_id), family = poisson())
+elev2_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + (log(sl_) + cos(ta_)):(elevation_start + I(elevation_start^2)) + (1 | id / indiv_step_id), family = poisson())
+
+models = c("w(.)phi(.)", "w(elev)phi(.)", "w(.)phi(elev)", "w(elev)phi(elev)", "w(elev2)phi(.)", "w(.)phi(elev2)", "w(elev2)phi(elev2)")
+aictab(cand.set = list(elev_null, elev_sf, elev_mk, elev_sfmk, elev2_sf, elev2_mk, elev2_sfmk), modnames = models)
+
+# Slope - quadratic or not
+slope_null = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id), family = poisson())
+
+slope_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + slope_end + (1 | id / indiv_step_id), family = poisson())
+slope_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (log(sl_) + cos(ta_)):slope_start + (1 | id / indiv_step_id), family = poisson())
+slope_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + slope_end + (log(sl_) + cos(ta_)):slope_start + (1 | id / indiv_step_id), family = poisson())
+
+slope2_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + slope_end + I(slope_end^2) + (1 | id / indiv_step_id), family = poisson())
+slope2_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + (log(sl_) + cos(ta_)):(slope_start + I(slope_start^2)) + (1 | id / indiv_step_id), family = poisson())
+slope2_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + log(sl_) + cos(ta_) + slope_end + I(slope_end^2) + (log(sl_) + cos(ta_)):(slope_start + I(slope_start^2)) + (1 | id / indiv_step_id), family = poisson())
+
+models = c("w(.)phi(.)", "w(slope)phi(.)", "w(.)phi(slope)", "w(slope)phi(slope)", "w(slope2)phi(.)", "w(.)phi(slope2)", "w(slope2)phi(slope2)")
+aictab(cand.set = list(slope_null, slope_sf, slope_mk, slope_sfmk, slope2_sf, slope2_mk, slope2_sfmk), modnames = models)
+
+# Elevation vs distance to rivers
+#null = glmmTMB(data = steps_1, formula = case_ ~ -1 + sl_ + log(sl_) + cos(ta_) + (1 | id / indiv_step_id), family = poisson())
+#elevation_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + sl_ + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + (1 | id / indiv_step_id), family = poisson())
+#elevation_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + sl_ + log(sl_) + cos(ta_) + (sl_ + log(sl_) + cos(ta_)):(elevation_start + I(elevation_start^2)) + (1 | id / #indiv_step_id), family = poisson())
+#elevation_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + sl_ + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + (sl_ + log(sl_) + cos(ta_)):(elevation_start + I(elevation_start^2)) + (1 | indiv_step_id) + (1 | id), family = poisson())
+#dist_to_rivers_sf = glmmTMB(data = steps_1, formula = case_ ~ -1 + sl_ + log(sl_) + cos(ta_) + dist_to_rivers_end + (1 | id / indiv_step_id), family = poisson())
+#dist_to_rivers_mk = glmmTMB(data = steps_1, formula = case_ ~ -1 + sl_ + log(sl_) + cos(ta_) + (sl_ + log(sl_) + cos(ta_)):dist_to_rivers_start + (1 | id / indiv_step_id), family = poisson())
+#dist_to_rivers_sfmk = glmmTMB(data = steps_1, formula = case_ ~ -1 + sl_ + log(sl_) + cos(ta_) + dist_to_rivers_end + (sl_ + log(sl_) + cos(ta_)):dist_to_rivers_start + (1 | id / indiv_step_id), family = poisson())
+
+#models = c("w(.)phi(.)", "w(elevation)phi(.)", "w(.)phi(elevation)", "w(elevation)phi(elevation)", "w(dist_to_rivers)phi(.)", "w(.)phi(dist_to_rivers)", "w(dist_to_rivers)phi(dist_to_rivers)")
+#aictab(cand.set = list(null, elevation_sf, elevation_mk, elevation_sfmk, dist_to_rivers_sf, dist_to_rivers_mk, dist_to_rivers_sfmk), modnames = models)
+```
+
+```{r base model, eval = FALSE}
+# Selection
+sf1 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_))
+sf2 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end)
+sf3 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2))
+sf4 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + dist_to_rivers_end)
+sf5 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + slope_end + I(slope_end^2))
+sf6 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + impervious_end + I(impervious_end^2))
+sf7 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + elevation_end + I(elevation_end^2))
+sf8 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + dist_to_rivers_end)
+sf9 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + slope_end + I(slope_end^2))
+sf10 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + impervious_end + I(impervious_end^2))
+sf11 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + dist_to_rivers_end)
+sf12 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + slope_end + I(slope_end^2))
+sf13 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + impervious_end + I(impervious_end^2))
+sf14 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + dist_to_rivers_end + slope_end + I(slope_end^2))
+sf15 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + dist_to_rivers_end + impervious_end + I(impervious_end^2))
+sf16 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2))
+sf17 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2))
+sf18 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2))
+sf19 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + dist_to_rivers_end + impervious_end + I(impervious_end^2))
+sf20 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2))
+sf21 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2))
+sf22 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + dist_to_rivers_end + impervious_end + I(impervious_end^2))
+sf23 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + dist_to_rivers_end + slope_end + I(slope_end^2))
+sf24 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + elevation_end + I(elevation_end^2) + impervious_end + I(impervious_end^2))
+sf25 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + elevation_end + I(elevation_end^2) + slope_end + I(slope_end^2))
+sf26 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end)
+sf27 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2))
+sf28 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2))
+sf29 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + elevation_end + I(elevation_end^2) + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2))
+sf30 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + impervious_end + I(impervious_end^2))
+sf31 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2))
+sf32 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + (1 | id / indiv_step_id) + log(sl_) + cos(ta_) + canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2))
+
+models = c("w(.) phi(.)", "w(canopy) phi(.)", "w(elevation + elevation2) phi(.)", "w(dist_to_rivers) phi(.)", "w(slope + slope2) phi(.)", "w(imperviousness + imperviousness2) phi(.)", "w(canopy + elevation + elevation2) phi(.)", "w(canopy + dist_to_rivers) phi(.)", "w(canopy + slope + slope2) phi(.)", "w(canopy + imperviousness + imperviousness2) phi(.)", "w(elevation + elevation2 + dist_to_rivers) phi(.)", "w(elevation + elevation2 + slope + slope2) phi(.)", "w(elevation + elevation2 + imperviousness + imperviousness2) phi(.)", "w(dist_to_rivers + slope + slope2) phi(.)", "w(dist_to_rivers + imperviousness + imperviousness2) phi(.)", "w(slope + slope2 + imperviousness + imperviousness2) phi(.)", "w(dist_to_rivers + slope + slope2 + imperviousness + imperviousness2) phi(.)", "w(elevation + elevation2 + slope + slope2 + imperviousness + imperviousness2) phi(.)", "w(elevation + elevation2 + dist_to_rivers + imperviousness + imperviousness2) phi(.)", "w(elevation + elevation2 + dist_to_rivers + slope + slope2) phi(.)", "w(canopy + slope + slope2 + imperviousness + imperviousness2) phi(.)", "w(canopy + dist_to_rivers + imperviousness + imperviousness2) phi(.)", "w(canopy + dist_to_rivers + slope + slope2) phi(.)", "w(canopy + elevation + elevation2 + imperviousness + imperviousness2) phi(.)", "w(canopy + elevation + elevation2 + slope + slope2) phi(.)", "w(canopy + elevation + elevation2 + dist_to_rivers) phi(.)", "w(elevation + elevation2 + dist_to_rivers + slope + slope2 + imperviousness + imperviousness2) phi(.)", "w(canopy + dist_to_rivers + slope + slope2 + imperviousness + imperviousness2) phi(.)", "w(canopy + elevation + elevation2 + slope + slope2 + imperviousness + imperviousness2) phi(.)", "w(canopy + elevation + elevation2 + dist_to_rivers + imperviousness + imperviousness2) phi(.)", "w(canopy + elevation + elevation2 + dist_to_rivers + slope + slope2) phi(.)", "w(canopy + elevation + elevation2 + dist_to_rivers + slope + slope2 + imperviousness + imperviousness2) phi(.)")
+aic_sf_1 = aictab(cand.set = list(sf1, sf2, sf3, sf4, sf5, sf6, sf7, sf8, sf9, sf10, sf11, sf12, sf13, sf14, sf15, sf16, sf17, sf18, sf19, sf20, sf21, sf22, sf23, sf24, sf25, sf26, sf27, sf28, sf29, sf30, sf31, sf32), modnames = models)
+aic_sf_1
+write.csv(aic_sf_1, file = "output/aic_sf_1.csv")
+```
+
+```{r hypothesis testing}
+m0 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2))
+
+m1 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + treatment_end)
+
+m2 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) +  
+               (log(sl_) + cos(ta_)):(treatment_start))
+
+m3 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + treatment_end + 
+               (log(sl_) + cos(ta_)):(treatment_start))
+
+m4 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + treatment_end + time + treatment_end:time)
+
+m5 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + 
+               (log(sl_) + cos(ta_)):(treatment_start + time + treatment_start:time))
+
+m6 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + treatment_end + time + treatment_end:time +
+               (log(sl_) + cos(ta_)):(treatment_start + time + treatment_start:time))
+
+m7 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + treatment_end + food + treatment_end:food)
+
+m8 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) +  
+               (log(sl_) + cos(ta_)):(treatment_start + food + treatment_start:food))
+
+m9 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + treatment_end + food + treatment_end:food + 
+               (log(sl_) + cos(ta_)):(treatment_start + food + treatment_start:food))
+
+m10 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + treatment_end + food + time + treatment_end:food:time)
+
+m11 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) +  
+               (log(sl_) + cos(ta_)):(treatment_start + food + time + treatment_start:food:time))
+
+m12 = glmmTMB(data = steps_1, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id / indiv_step_id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + treatment_end + food + time + treatment_end:food:time + 
+               (log(sl_) + cos(ta_)):(treatment_start + food + time + treatment_start:food:time))
+
+models = c("m0: w(base)phi(base)", "m1: w(base + treatment)phi(base)","m2: w(base)phi(base + treatment)","m3: w(base + treatment)phi(base + treatment)", "m4:w(base + treatment*time)phi(base)", "m5:w(base)phi(base + treatment*time)", "m6:w(base + treatment*time)phi(base + treatment*time)", "m7:w(base + treatment*food)phi(base)", "m8:w(base)phi(base + treatment*food)", "m9:w(base + treatment*food)phi(base + treatment*food)", "m10:w(base + treatment*food*time)phi(base)", "m11:w(base)phi(base + treatment*food*time)", "m12:w(base + treatment*food*time)phi(base + treatment*food*time)")
+aic_1 = aictab(cand.set = list(m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12), modnames = models) 
+aic_1
+write.csv(aic_1, "output/aic_1.csv")
+```
+
+```{r coefficients}
+summary(m0)
+coeffs_1 = as.data.frame(summary(m0)[["coefficients"]][["cond"]][1:10,1:2])
+coeffs_2 = as.data.frame(confint(m0))[1:10,1:2]
+coeffs = cbind(rownames(coeffs_1), coeffs_1, coeffs_2)
+colnames(coeffs)[1] = "Variable"
+write.csv(coeffs, file = "output/coeffs_m0.csv")
+
+summary(m4)
+coeffs_1 = as.data.frame(summary(m4)[["coefficients"]][["cond"]][1:13,1:2])
+coeffs_2 = as.data.frame(confint(m4))[1:13,1:2]
+coeffs = cbind(rownames(coeffs_1), coeffs_1, coeffs_2)
+colnames(coeffs)[1] = "Variable"
+write.csv(coeffs, file = "output/coeffs_m4.csv")
+
+summary(m6)
+coeffs_1 = as.data.frame(summary(m6)[["coefficients"]][["cond"]][1:19,1:2])
+coeffs_2 = as.data.frame(confint(m6))[1:19,1:2]
+coeffs = cbind(rownames(coeffs_1), coeffs_1, coeffs_2)
+colnames(coeffs)[1] = "Variable"
+write.csv(coeffs, file = "output/coeffs_m6.csv")
+```
+
+```{r validation, eval = FALSE}
+set.seed(100)
+#K-fold partition by ID
+s = sample(rep(c(1:5), nrow(steps_1[which(steps_1$case_==T),])/5+1), replace = F)
+k = rep(s[1:(nrow(steps_1)/11)], each = 11)
+steps_1 = steps_1 %>% mutate(k_ = k)
+rs = data.frame()
+# for each fold
+for(i in 1:5) {
+  train.k = steps_1 %>% filter(k != i)
+  valid.k = steps_1 %>% filter(k == i)
+  m4.k = glmmTMB(data = train.k, family = poisson(), formula = case_ ~ -1 + log(sl_) + cos(ta_) + (1 | id) +
+                canopy_end + elevation_end + I(elevation_end^2) + dist_to_rivers_end + slope_end + I(slope_end^2) + impervious_end + I(impervious_end^2) + treatment_end + time + treatment_end:time)
+  valid.k$prediction = predict(object = m4.k, newdata = valid.k, type = "response") 
+  used.k = valid.k %>% filter(case_ == T) %>% filter(prediction <= 1)
+  avail.k = valid.k %>% filter(case_ == F) %>% filter(prediction <= 1)
+  ranks = data.frame(bin = hist(used.k$prediction, breaks = seq(0,1,.1), plot = F)$mids,
+                 freq = hist(used.k$prediction, breaks = seq(0,1,.1), plot = F)$counts/hist(avail.k$prediction, breaks = seq(0,1,.1), plot = F)$counts) %>% 
+    mutate(freq = replace_na(freq,0)) %>% 
+    mutate(rank = rank(-freq))
+  cor = cor.test(ranks$bin, ranks$rank, method = ("spearman"))
+  rs.k = c(i, cor[["estimate"]][["rho"]], cor[["p.value"]])
+  rs = rbind(rs, rs.k)
+}
+colnames(rs) = c("k", "rs", "p-value")
+rs = rbind(rs, c("Mean", colMeans(rs)[2:3]))
+write.csv(rs, file = "output/rs_validation.csv")
+```
+
+# Results
+
+```{r selection effects}
+s = 12
+# Canopy
+predictions = steps_1 %>% filter(case_ == F)  %>%
+  mutate(sl_ = rep(mean(steps_1$sl_)),
+         ta_ = rep(mean(steps_1$ta_)),
+         #canopy_end = rep(mean(steps_1$canopy_end)), 
+         elevation_end = rep(mean(steps_1$elevation_end)), 
+         dist_to_rivers_end = rep(mean(steps_1$dist_to_rivers_end)), 
+         slope_end = rep(mean(steps_1$slope_end)), 
+         impervious_end = rep(mean(steps_1$impervious_end)))
+predictions = predictions %>% 
+  mutate(use = predict(object = m0, newdata = predictions, type = "response")) %>% 
+  mutate(canopy_end = canopy_end * covariates_1["canopy_end","sd"] + covariates_1["canopy_end","mean"])
+quantile(predictions$canopy_end, probs = c(0.01, 0.05, 0.95, 0.99))
+
+gg_use_can = ggplot(predictions %>% filter(canopy_end > 1) %>% filter(canopy_end < 47)) +
+  geom_line(aes(x = canopy_end, y = use, col = BearID, group = ID), show.legend = F) +
+  geom_smooth(aes(x = canopy_end, y = use), col = "black", linewidth = 2) + 
+  scale_color_viridis(discrete = T, option = "turbo",  begin = 0, end = 1) +
+  labs(x = "Canopy (%)", y = "Relative probability of use") +
+  scale_x_continuous(breaks = seq(0, 50, 10)) + scale_y_continuous(limits = c(0, 0.3)) +
+  theme_classic() + theme(text = element_text(size = s))
+
+# Elevation
+predictions = steps_1 %>% filter(case_ == F)  %>%
+  mutate(sl_ = rep(mean(steps_1$sl_)),
+         ta_ = rep(mean(steps_1$ta_)),
+         canopy_end = rep(mean(steps_1$canopy_end)), 
+         #elevation_end = rep(mean(steps_1$elevation_end)), 
+         dist_to_rivers_end = rep(mean(steps_1$dist_to_rivers_end)), 
+         slope_end = rep(mean(steps_1$slope_end)), 
+         impervious_end = rep(mean(steps_1$impervious_end)))
+predictions = predictions %>% 
+  mutate(use = predict(object = m0, newdata = predictions, type = "response")) %>% 
+  mutate(elevation_end = elevation_end * covariates_1["elevation_end","sd"] + covariates_1["elevation_end","mean"])
+quantile(predictions$elevation_end, probs = c(0.01, 0.05, 0.95, 0.99))
+
+gg_use_elev = ggplot(predictions %>% filter(elevation_end > 1988) %>% filter(elevation_end < 2180)) +
+  geom_line(aes(x = elevation_end, y = use, col = BearID, group = ID), show.legend = F) +
+  geom_smooth(aes(x = elevation_end, y = use), col = "black", linewidth = 2) + 
+  scale_color_viridis(discrete = T, option = "turbo",  begin = 0, end = 1) +
+  labs(x = "Elevation (m)", y = "Relative probability of use") +
+  scale_x_continuous(breaks = seq(1950, 2200, 50)) + scale_y_continuous(limits = c(0, 0.3)) +
+  theme_classic() + theme(text = element_text(size = s))
+
+# Distance to rivers
+predictions = steps_1 %>% filter(case_ == F)  %>%
+  mutate(sl_ = rep(mean(steps_1$sl_)),
+         ta_ = rep(mean(steps_1$ta_)),
+         canopy_end = rep(mean(steps_1$canopy_end)), 
+         elevation_end = rep(mean(steps_1$elevation_end)), 
+         #dist_to_rivers_end = rep(mean(steps_1$dist_to_rivers_end)), 
+         slope_end = rep(mean(steps_1$slope_end)), 
+         impervious_end = rep(mean(steps_1$impervious_end)))
+predictions = predictions %>% 
+  mutate(use = predict(object = m0, newdata = predictions, type = "response")) %>% 
+  mutate(dist_to_rivers_end = exp(dist_to_rivers_end * covariates_1["dist_to_rivers_end","sd"] + covariates_1["dist_to_rivers_end","mean"]) + 1 ) 
+quantile(predictions$dist_to_rivers_end, probs = c(0.01, 0.05, 0.95, 0.99))
+
+gg_use_riv = ggplot(predictions %>% filter(dist_to_rivers_end > 32)  %>% filter(dist_to_rivers_end < 796)) +
+  geom_line(aes(x = dist_to_rivers_end, y = use, col = BearID, group = ID), show.legend = F) +
+  geom_smooth(aes(x = dist_to_rivers_end, y = use), col = "black", linewidth = 2) + 
+  scale_color_viridis(discrete = T, option = "turbo",  begin = 0, end = 1) +
+  labs(x = "Distance to rivers (m)", y = "Relative probability of use") +
+  scale_x_continuous(breaks = seq(0, 800, 200)) + scale_y_continuous(limits = c(0, 0.3)) +
+  theme_classic() + theme(text = element_text(size = s))
+
+# Slope
+predictions = steps_1 %>% filter(case_ == F)  %>%
+  mutate(sl_ = rep(mean(steps_1$sl_)),
+         ta_ = rep(mean(steps_1$ta_)),
+         canopy_end = rep(mean(steps_1$canopy_end)), 
+         elevation_end = rep(mean(steps_1$elevation_end)), 
+         dist_to_rivers_end = rep(mean(steps_1$dist_to_rivers_end)), 
+         #slope_end = rep(mean(steps_1$slope_end)), 
+         impervious_end = rep(mean(steps_1$impervious_end)))
+predictions = predictions %>% 
+  mutate(use = predict(object = m0, newdata = predictions, type = "response")) %>% 
+  mutate(slope_end = slope_end * covariates_1["slope_end","sd"] + covariates_1["slope_end","mean"])
+quantile(predictions$slope_end, probs = c(0.01, 0.05, 0.95, 0.99))
+
+gg_use_slope = ggplot(predictions %>% filter(slope_end > 0.25) %>% filter(slope_end < 35)) +
+  geom_line(aes(x = slope_end, y = use, col = BearID, group = ID), show.legend = F) +
+  geom_smooth(aes(x = slope_end, y = use), col = "black", linewidth = 2) + 
+  scale_color_viridis(discrete = T, option = "turbo",  begin = 0, end = 1) +
+  labs(x = expression(paste("Slope (", degree, ")")), y = "Relative probability of use") +
+  scale_x_continuous(breaks = seq(0, 40, 10)) + scale_y_continuous(limits = c(0, 0.3)) +
+  theme_classic() + theme(text = element_text(size = s))
+
+# Impervious surfaces
+predictions = steps_1 %>% filter(case_ == F)  %>%
+  mutate(sl_ = rep(mean(steps_1$sl_)),
+         ta_ = rep(mean(steps_1$ta_)),
+         canopy_end = rep(mean(steps_1$canopy_end)), 
+         elevation_end = rep(mean(steps_1$elevation_end)), 
+         dist_to_rivers_end = rep(mean(steps_1$dist_to_rivers_end)), 
+         slope_end = rep(mean(steps_1$slope_end)), 
+         #impervious_end = rep(mean(steps_1$impervious_end)),
+         )
+predictions = predictions %>% 
+  mutate(use = predict(object = m0, newdata = predictions, type = "response")) %>% 
+  mutate(impervious_end = impervious_end * covariates_1["impervious_end","sd"] + covariates_1["impervious_end","mean"]) 
+quantile(predictions$impervious_end, probs = c(0.01, 0.05, 0.95, 0.99))
+
+gg_use_imp = ggplot(predictions %>% filter(impervious_end > 1)  %>% filter(impervious_end < 85) %>% filter(ID != "B49_2011")) +
+  geom_line(aes(x = impervious_end, y = use, col = BearID, group = ID), show.legend = F) +
+  geom_smooth(aes(x = impervious_end, y = use), col = "black", linewidth = 2) + 
+  scale_color_viridis(discrete = T, option = "turbo",  begin = 0, end = 1) +
+  labs(x = "Imperviousness (%)", y = "Relative probability of use") +
+  scale_x_continuous(breaks = seq(0, 90, 20)) + scale_y_continuous(limits = c(0, 0.3)) +
+  theme_classic() + theme(text = element_text(size = s))
+
+fig4 = ggarrange(gg_use_can, gg_use_elev, gg_use_riv, gg_use_slope, gg_use_imp)
+fig4
+
+# Treatment
+predictions = steps_1 %>% filter(case_ == F)  %>%
+  mutate(sl_ = rep(mean(steps_1$sl_)),
+         ta_ = rep(mean(steps_1$ta_)),
+         canopy_end = rep(mean(steps_1$canopy_end)), 
+         elevation_end = rep(mean(steps_1$elevation_end)), 
+         dist_to_rivers_end = rep(mean(steps_1$dist_to_rivers_end)), 
+         slope_end = rep(mean(steps_1$slope_end)), 
+         impervious_end = rep(mean(steps_1$impervious_end)),
+         food = rep(mean(steps_1$food)))
+         #treatment_end = rep(0)) #in control conditions
+predictions = predictions %>% 
+  mutate(use = predict(object = m4, newdata = predictions, type = "response")) %>% 
+  mutate(before = case_when(Year == 2011 | Year == 2012 ~ "before", Year == 2013 | Year == 2014 | Year == 2015 | Year == 2016 ~ "after")) %>% mutate(before = as.factor(before)) %>% 
+  mutate(color = factor(paste(before, treatment_end), levels = c("before 0", "after 0", "after 1"))) %>% 
+  mutate(group = interaction(time, treatment_end)) %>% 
+  mutate(Year2 = case_when(Year == 2011 | Year == 2012 ~ 2011.5, Year == 2013 | Year == 2014 | Year == 2015 | Year == 2016 ~ Year))
+
+# Effect size
+effects = predictions %>% 
+  group_by(Year, treatment_end) %>% 
+  summarise(mean = mean(use),
+            sd = sd(use)) %>% 
+  pivot_wider(values_from = c(mean, sd), names_from = treatment_end)
+# Percent change in control
+round((effects$mean_0[6] - effects$mean_0[3]) / effects$mean_0[3] * 100, 2)
+# Percent change in treatment
+round((effects$mean_1[6] - effects$mean_1[3]) / effects$mean_1[3] * 100, 2)
+
+# Boxplot
+fig5 = ggplot(predictions) +
+  geom_boxplot(aes(x = Year, y = use, group = interaction(time, treatment_end), col = color, fill = color), alpha = 0.5, show.legend = T) +
+  geom_point(aes(x = Year2, y = use, group = interaction(time, treatment_end),  col = color), show.legend = T, position = position_dodge(width = 0.75)) +
+  geom_vline(aes(xintercept = 2012.5), linetype = "dashed", col = "grey40") +
+  scale_color_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  scale_fill_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  labs(x = "Year", y = "Relative probability of use") +
+  scale_x_continuous(breaks = c(2011:2016), limits = c(2010.5, 2016.5)) + scale_y_continuous(limits = c(0, 0.2)) +
+  theme_classic() + theme(text = element_text(size = s), legend.position = "bottom")
+
+fig5
+```
+
+```{r individual learning}
+s = 12
+#B27
+steps_b27 = steps_1 %>% filter(BearID == "B27")
+predictions = steps_b27 %>% filter(case_ == F)  %>%
+  mutate(sl_ = rep(mean(steps_b27$sl_)),
+         ta_ = rep(mean(steps_b27$ta_)),
+         canopy_end = rep(mean(steps_b27$canopy_end)), 
+         elevation_end = rep(mean(steps_b27$elevation_end)), 
+         dist_to_rivers_end = rep(mean(steps_b27$dist_to_rivers_end)), 
+         slope_end = rep(mean(steps_b27$slope_end)), 
+         impervious_end = rep(mean(steps_b27$impervious_end)),
+         food = rep(mean(steps_b27$food)))
+
+predictions = predictions %>% 
+  mutate(use = predict(object = m4, newdata = predictions, type = "response")) %>% 
+  mutate(use.se = predict(object = m4, newdata = predictions, type = "response", se.fit = T)$se.fit) %>% 
+  mutate(before = case_when(Year == 2011 | Year == 2012 ~ "before", Year == 2013 | Year == 2014 | Year == 2015 | Year == 2016 ~ "after")) %>% mutate(before = as.factor(before)) %>% 
+  mutate(color = factor(paste(before, treatment_end), levels = c("before 0", "after 0", "after 1")))
+
+ggb27 = ggplot(predictions) +
+  geom_point(aes(x = Year, y = use, group = interaction(time, treatment_end), col = color, fill = color), size = 3, show.legend = T, position = position_dodge(width = 0.4)) +
+  geom_linerange(aes(x = Year, ymin = use-use.se*1.96, ymax = use+use.se*1.96, group = interaction(time, treatment_end), col = color), linewidth = .75, position = position_dodge(width = .4)) +
+  geom_vline(aes(xintercept = 2012.5), linetype = "longdash", col = "grey40") +
+  scale_color_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  scale_fill_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  labs(x = "Year", y = "Relative probability of use", title = "B27") +
+  scale_x_continuous(limits = c(2011, 2016.5), breaks = c(2011:2016)) +
+  scale_y_continuous(limits = c(0, 0.25)) +
+  theme_classic() + theme(text = element_text(size = s))
+
+#B7
+steps_b7 = steps_1 %>% filter(BearID == "B7")
+predictions = steps_b7 %>% filter(case_ == F)  %>%
+  mutate(sl_ = rep(mean(steps_b7$sl_)),
+         ta_ = rep(mean(steps_b7$ta_)),
+         canopy_end = rep(mean(steps_b7$canopy_end)), 
+         elevation_end = rep(mean(steps_b7$elevation_end)), 
+         dist_to_rivers_end = rep(mean(steps_b7$dist_to_rivers_end)), 
+         slope_end = rep(mean(steps_b7$slope_end)), 
+         impervious_end = rep(mean(steps_b7$impervious_end)),
+         food = rep(mean(steps_b7$food)))
+predictions = predictions %>% 
+  mutate(use = predict(object = m4, newdata = predictions, type = "response")) %>% 
+  mutate(use.se = predict(object = m4, newdata = predictions, type = "response", se.fit = T)$se.fit) %>% 
+  mutate(before = case_when(Year == 2011 | Year == 2012 ~ "before", Year == 2013 | Year == 2014 | Year == 2015 | Year == 2016 ~ "after")) %>% mutate(before = as.factor(before)) %>% 
+  mutate(color = factor(paste(before, treatment_end), levels = c("before 0", "after 0", "after 1")))
+
+ggb7 = ggplot(predictions) +
+  geom_point(aes(x = Year, y = use, group = interaction(time, treatment_end), col = color, fill = color), size = 3, show.legend = T,position = position_dodge(width = .4)) +
+  geom_linerange(aes(x = Year, ymin = use-use.se*1.96, ymax = use+use.se*1.96, group = interaction(time, treatment_end), col = color), linewidth = .75, position = position_dodge(width = .4)) +
+  geom_vline(aes(xintercept = 2012.5), linetype = "longdash", col = "grey40") +
+  scale_color_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  scale_fill_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  labs(x = "Year", y = "Relative probability of use", title = "B7") +
+  scale_x_continuous(limits = c(2011, 2016.5), breaks = c(2011:2016)) +
+  scale_y_continuous(limits = c(0, 0.25)) +
+  theme_classic() + theme(text = element_text(size = s))
+
+#B125
+steps_b125 = steps_1 %>% filter(BearID == "B125")
+predictions = steps_b125 %>% filter(case_ == F)  %>%
+  mutate(sl_ = rep(mean(steps_b125$sl_)),
+         ta_ = rep(mean(steps_b125$ta_)),
+         canopy_end = rep(mean(steps_b125$canopy_end)), 
+         elevation_end = rep(mean(steps_b125$elevation_end)), 
+         dist_to_rivers_end = rep(mean(steps_b125$dist_to_rivers_end)), 
+         slope_end = rep(mean(steps_b125$slope_end)), 
+         impervious_end = rep(mean(steps_b125$impervious_end)),
+         food = rep(mean(steps_b125$food)))
+predictions = predictions %>% 
+  mutate(use = predict(object = m4, newdata = predictions, type = "response")) %>% 
+  mutate(use.se = predict(object = m4, newdata = predictions, type = "response", se.fit = T)$se.fit) %>% 
+  mutate(before = case_when(Year == 2011 | Year == 2012 ~ "before", Year == 2013 | Year == 2014 | Year == 2015 | Year == 2016 ~ "after")) %>% mutate(before = as.factor(before)) %>% 
+  mutate(color = factor(paste(before, treatment_end), levels = c("before 0", "after 0", "after 1")))
+
+ggb125 = ggplot(predictions) +
+  geom_point(aes(x = Year, y = use, group = interaction(time, treatment_end), col = color, fill = color), size = 3, show.legend = T, position = position_dodge(width = .4)) +
+  geom_linerange(aes(x = Year, ymin = use-use.se*1.96, ymax = use+use.se*1.96, group = interaction(time, treatment_end), col = color), linewidth = .75, position = position_dodge(width = .4)) +
+  geom_vline(aes(xintercept = 2012.5), linetype = "longdash", col = "grey40") +
+  scale_color_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  scale_fill_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  labs(x = "Year", y = "Relative probability of use", title = "B125") +
+  scale_x_continuous(limits = c(2011, 2016.5), breaks = c(2011:2016)) +
+  scale_y_continuous(limits = c(0, 0.25)) +
+  theme_classic() + theme(text = element_text(size = s))
+
+
+fig6 = ggarrange(ggb27, ggb7, ggb125, nrow = 3, ncol = 1, common.legend = T, legend = "bottom")
+
+fig6
+```
+
+```{r updating individual movement parameters}
+obs_1 = steps_1 %>% filter(case_ == T) %>% nest(data = -c(ID, BearID, Year))
+coeffs = as.data.frame(summary(m6)[["coefficients"]][["cond"]])
+
+params = data.frame()
+for(i in 1:nrow(obs_1)) {
+  data.i = obs_1[["data"]][[i]]
+  # Step lengths
+  sl_distr.i = fit_distr(data.i$sl_, "gamma")
+  # tentative shape
+  k0.i = sl_distr.i$params$shape
+  # updating shape
+  khat.i = k0.i + coeffs["log(sl_)","Estimate"]
+  # tentative scale
+  q0.i = sl_distr.i$params$scale
+  qhat.i = q0.i 
+  # Turn angles
+  ta_distr.i = fit_distr(data.i$ta_, "vonmises")
+  # tentative concentration
+  v0.i = ta_distr.i$params$kappa
+  # updating concentration
+  vhat.i = v0.i + coeffs["cos(ta_)","Estimate"]
+  params.i = c(obs_1[["ID"]][[i]], khat.i, qhat.i, vhat.i)
+  params = rbind(params, params.i)
+}
+colnames(params) = c("ID", "k", "q", "v")
+params = params %>% mutate(across(c(k, q, v), as.numeric))
+```
+
+```{r movement effects treatment}
+#Speed
+treatment_speed = params
+t.range = c(0,1,2,3,4)
+
+for (t in t.range) { 
+  #shape
+  k.ct = params$k + coeffs["log(sl_):treatment_start", "Estimate"]*0 + coeffs["log(sl_):time", "Estimate"]*0 + coeffs["log(sl_):time:treatment_start", "Estimate"]*0*0
+  k.tr = params$k + coeffs["log(sl_):treatment_start", "Estimate"]*1 + coeffs["log(sl_):time", "Estimate"]*t + coeffs["log(sl_):time:treatment_start", "Estimate"]*1*t
+  #scale
+  q.ct = params$q
+  q.tr = params$q
+  treatment_speed[[paste("treatment", t, sep = "_")]] = k.tr*q.tr
+  treatment_speed[[paste("control", t, sep = "_")]] = k.ct*q.ct
+  }
+treatment_speed = treatment_speed %>% dplyr::select(!c(ID, k, q, v)) %>% t() %>% as.data.frame() 
+colnames(treatment_speed) = params$ID
+treatment_speed = treatment_speed %>% mutate(treatment = as.factor(gsub('.{0,2}$', '', rownames(.)))) 
+
+treatment_speed = cbind(t.range, treatment_speed) %>% pivot_longer(cols = starts_with("B"), names_to = "BearID", values_to = "speed") %>% 
+  mutate(year = t.range + 2012) %>% 
+  mutate(year = case_when(year == 2012 ~ 2011.5,  year == 2013 | year == 2014 | year == 2015 | year == 2016 ~ year)) %>% 
+  mutate(before = case_when(year == 2011.5 ~ "before", year == 2013 | year == 2014 | year == 2015 | year == 2016 ~ "after")) %>% mutate(before = as.factor(before))  %>% 
+  filter(!c(t.range == 0 & treatment == "control")) %>% 
+  mutate(color = factor(paste(before, treatment), levels = c("before treatment", "after control", "after treatment")))
+
+gg_treatment_speed = ggplot(treatment_speed) +
+  geom_boxplot(aes(x = year, y = speed, group = interaction(year, treatment), col = color, fill = color), alpha = .75, show.legend = T) +
+ # geom_point(aes(x = year, y = speed, group = interaction(year, treatment),  col = color), show.legend = T, position = position_dodge(width = 0.75)) +
+  geom_vline(aes(xintercept = 2012.5), linetype = "longdash", col = "grey40") +
+  scale_color_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  scale_fill_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  labs(x = "Year", y = "Speed (m/h)") +
+  theme_classic() + theme(text = element_text(size = s))
+
+#Straightness
+treatment_kappa = params
+
+for (t in t.range) { 
+  treatment_kappa[[paste("control", t, sep = "_")]] = params$v + coeffs["cos(ta_):treatment_start","Estimate"]*0 + coeffs["cos(ta_):time", "Estimate"]*0 + coeffs["cos(ta_):time:treatment_start", "Estimate"]*0*0
+  treatment_kappa[[paste("treatment", t, sep = "_")]] = params$v + coeffs["cos(ta_):treatment_start","Estimate"]*1 + coeffs["cos(ta_):time", "Estimate"]*t + coeffs["cos(ta_):time:treatment_start", "Estimate"]*1*t
+}
+
+treatment_kappa = treatment_kappa %>% dplyr::select(!c(ID, k, q, v)) %>% t() %>% as.data.frame() 
+colnames(treatment_kappa) = params$ID
+treatment_kappa = treatment_kappa %>% mutate(treatment = as.factor(gsub('.{0,2}$', '', rownames(.)))) 
+
+treatment_kappa = cbind(t.range, treatment_kappa) %>% pivot_longer(cols = starts_with("B"), names_to = "BearID", values_to = "kappa") %>% 
+  mutate(year = t.range + 2012) %>% 
+  mutate(year = case_when(year == 2012 ~ 2011.5,  year == 2013 | year == 2014 | year == 2015 | year == 2016 ~ year)) %>% 
+  mutate(before = case_when(year == 2011.5 ~ "before", year == 2013 | year == 2014 | year == 2015 | year == 2016 ~ "after")) %>% mutate(before = as.factor(before)) %>% 
+  filter(!c(t.range == 0 & treatment == "control")) %>% 
+  mutate(color = factor(paste(before, treatment), levels = c("before treatment", "after control", "after treatment")))
+
+gg_treatment_kappa = ggplot(treatment_kappa) +
+  geom_boxplot(aes(x = year, y = kappa, group = interaction(year, treatment), col = color, fill = color), alpha = .75, show.legend = T) +
+  #geom_point(aes(x = year, y = kappa, group = interaction(year, treatment),  col = color), show.legend = T, position = position_dodge(width = 0.75)) +
+  geom_vline(aes(xintercept = 2012.5), linetype = "longdash", col = "grey40") +
+  scale_color_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  scale_fill_manual(values = c("grey40","#440154FF", "#95D840FF"), name = "", labels = c("before","control","treatment")) +
+  labs(x = "Year", y = "Straightness") +
+  theme_classic() + theme(text = element_text(size = s))
+
+fig7 = ggarrange(gg_treatment_speed, gg_treatment_kappa, common.legend = T, legend = "bottom")
+fig7
+```
